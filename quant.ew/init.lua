@@ -298,7 +298,10 @@ function OnProjectileFired(
         local body = EntityGetFirstComponentIncludingDisabled(projectile_id, "PhysicsBody2Component")
         local proj = EntityGetFirstComponentIncludingDisabled(projectile_id, "ProjectileComponent")
         local life = EntityGetFirstComponentIncludingDisabled(projectile_id, "LifetimeComponent")
-        if outlives(proj, 4) or outlives(life, 4) then
+        -- Both limits apply, the projectile ends at the earlier one. With `or`, a
+        -- missing component (the usual case for LifetimeComponent) made this always
+        -- true.
+        if outlives(proj, 4) and outlives(life, 4) then
             if EntityGetIsAlive(projectile_id) then
                 ewext.sync_projectile(projectile_id, shooter_player_data.peer_id, rng)
             end

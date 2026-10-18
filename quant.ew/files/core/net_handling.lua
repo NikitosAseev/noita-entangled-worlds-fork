@@ -175,6 +175,9 @@ end
 
 function net_handling.mod.fire(peer_id, fire_data)
     local player_data = player_fns.peer_get_player_data(peer_id)
+    if player_data == nil or player_data.entity == nil then
+        return
+    end
     local entity = player_data.entity
     if not EntityGetIsAlive(entity) then
         return

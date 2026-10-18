@@ -1,4 +1,4 @@
-use std::{ffi::c_void, mem};
+use std::ffi::c_void;
 
 pub(crate) mod decode;
 pub(crate) mod ntypes;
@@ -13,6 +13,39 @@ pub(crate) struct ParticleWorldState {
 }
 
 impl ParticleWorldState {
+    /// The pixel array of the 512x512 chunk containing (x, y), if that chunk exists.
+    fn chunk_pixel_array(&self, x: i32, y: i32) -> Option<*const c_void> {
+        let x = x as isize;
+        let y = y as isize;
+        let chunk_index = (((((y) >> 9) - 256) & 511) * 512 + ((((x) >> 9) - 256) & 511)) * 4;
+        // Deref 1/3
+        let chunk_arr = unsafe { self.chunk_map_ptr.offset(8).cast::<*const c_void>().read() };
+        if chunk_arr.is_null() {
+            return None;
+        }
+        // Deref 2/3
+        let chunk = unsafe { chunk_arr.offset(chunk_index).cast::<*const c_void>().read() };
+        if chunk.is_null() {
+            return None;
+        }
+        // Deref 3/3
+        let pixel_array = unsafe { chunk.cast::<*const c_void>().read() };
+        if pixel_array.is_null() {
+            None
+        } else {
+            Some(pixel_array)
+        }
+    }
+
+    /// The cell at (x, y) in a chunk's pixel array from [`Self::chunk_pixel_array`].
+    fn cell_in_array<'a>(pixel_array: *const c_void, x: i32, y: i32) -> Option<&'a ntypes::Cell> {
+        let x = x as isize;
+        let y = y as isize;
+        let pixel = unsafe { pixel_array.offset((((y & 511) << 9) | x & 511) * 4) };
+        unsafe { pixel.cast::<*const ntypes::Cell>().read().as_ref() }
+    }
+
+    #[allow(dead_code)]
     fn get_cell_raw(&self, x: i32, y: i32) -> Option<&ntypes::Cell> {
         let x = x as isize;
         let y = y as isize;
@@ -52,11 +85,23 @@ impl ParticleWorldState {
         end_y: i32,
         mut pixel_runs: *mut pixel::NoitaPixelRun,
     ) -> usize {
-        // Allow compiler to generate better code.
-        assert_eq!(start_x % 128, 0);
-        assert_eq!(start_y % 128, 0);
-        assert!((end_x - start_x) <= 128);
-        assert!((end_y - start_y) <= 128);
+        // A panic here would unwind into the game across the FFI boundary, so bad
+        // arguments report "no runs" instead; the Lua side sends nothing for that.
+        if start_x % 128 != 0
+            || start_y % 128 != 0
+            || end_x <= start_x
+            || end_y <= start_y
+            || (end_x - start_x) > 128
+            || (end_y - start_y) > 128
+            || pixel_runs.is_null()
+        {
+            return 0;
+        }
+
+        // The area is 128-aligned and at most 128x128, so it lies inside a single
+        // 512x512 world chunk: resolve the chunk and its pixel array once instead
+        // of walking the three pointer levels for every pixel.
+        let pixel_array = self.chunk_pixel_array(start_x, start_y);
 
         for y in start_y..end_y {
             for x in start_x..end_x {
@@ -64,7 +109,7 @@ impl ParticleWorldState {
                     material: 0,
                     flags: 0,
                 };
-                let cell = self.get_cell_raw(x, y);
+                let cell = pixel_array.and_then(|array| Self::cell_in_array(array, x, y));
                 if let Some(cell) = cell {
                     let cell_type = self.get_cell_type(cell).unwrap_or(ntypes::CellType::None);
                     match cell_type {
@@ -73,7 +118,10 @@ impl ParticleWorldState {
                         ntypes::CellType::Solid => {}
                         ntypes::CellType::Liquid => {
                             raw_pixel.material = self.get_cell_material_id(cell);
-                            let cell: &ntypes::LiquidCell = unsafe { mem::transmute(cell) };
+                            // LiquidCell begins with a Cell; cell_type says it is one.
+                            let cell: &ntypes::LiquidCell = unsafe {
+                                &*(cell as *const ntypes::Cell).cast::<ntypes::LiquidCell>()
+                            };
                             raw_pixel.flags = cell.is_static as u8;
                         }
                         ntypes::CellType::Gas | ntypes::CellType::Fire => {

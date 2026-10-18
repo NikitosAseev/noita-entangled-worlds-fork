@@ -83,7 +83,7 @@ impl EntitySync {
     pub(crate) fn find_by_gid(&self, gid: Gid) -> Option<EntityID> {
         self.local_diff_model
             .find_by_gid(gid)
-            .or(self.remote_models.values().find_map(|r| r.find_by_gid(gid)))
+            .or_else(|| self.remote_models.values().find_map(|r| r.find_by_gid(gid)))
     }
     pub(crate) fn find_peer_by_gid(&self, gid: Gid) -> Option<&PeerId> {
         self.remote_models.iter().find_map(|(p, g)| {
@@ -197,28 +197,24 @@ impl EntitySync {
     ) -> eyre::Result<()> {
         let len = self.spawn_once.len();
         if len > 0 {
-            // TODO: same truncating index-window that `get_pos_data` used to have: `len / 20`
-            // rounds down, so a cycle never reaches past `20 * (len / 20)` and the last
-            // `len % 20` entries wait for a later cycle. Deliberately not converted alongside
-            // `get_pos_data`, for two reasons: it cannot underflow (the `while i > start_index`
-            // loop just no-ops when the window is empty), and the starvation is transient rather
-            // than permanent, because entries are removed as they spawn so `len` shrinks until
-            // the tail comes into range. It is also not the mechanical change it looks like --
-            // the loop body borrows `self.spawn_once[i]` while calling `&mut self` methods.
-            //
-            // The bigger problem here is that `spawn_once` is only drained when the camera comes
-            // within range and nothing ever prunes it, so it grows unboundedly over a session.
-            let batch_size = (len / 20).max(1);
+            // NOTE: `spawn_once` is only drained when the camera comes within range and
+            // nothing prunes it, so it can still grow over a long session.
+            // Rounded up, so that `20 * batch_size >= len` and every entry is reached
+            // within one 20 frame cycle (the old `len / 20` starved the tail).
+            let batch_size = len.div_ceil(20).max(1);
             let start_index = (frame_num % 20) * batch_size;
             let end_index = (start_index + batch_size).min(len);
             let mut i = end_index;
             while i > start_index {
                 i -= 1;
-                if i < self.spawn_once.len() {
-                    let (pos, data) = &self.spawn_once[i];
-                    if pos.contains(x, y, 512 + 256) {
+                if i < self.spawn_once.len() && self.spawn_once[i].0.contains(x, y, 512 + 256) {
+                    {
+                        // Taken out of the list *before* it is acted on: a `?` below
+                        // used to leave the entry in place, so one entry that always
+                        // fails was retried forever and blocked the rest.
+                        let (pos, data) = self.spawn_once.remove(i);
                         let (x, y) = (pos.x as f64, pos.y as f64);
-                        match data {
+                        match &data {
                             shared::SpawnOnce::Enemy(file, drops_gold, offending_peer) => {
                                 if let Ok(entity) = EntityID::load(file, Some(x), Some(y)) {
                                     entity.add_tag("ew_no_enemy_sync")?;
@@ -303,8 +299,6 @@ impl EntitySync {
                                 )?;
                             }
                         }
-                        self.spawn_once.remove(i);
-                        i += 1;
                     }
                 }
             }
@@ -663,7 +657,12 @@ impl Module for EntitySync {
         self.local_diff_model
             .enable_later(&mut self.entity_manager)?;
         self.local_diff_model.phys_later(&mut self.entity_manager)?;
-        let mut times = vec![0; 4];
+        // Only used when performance logging is on; don't allocate every frame.
+        let mut times: Vec<u128> = if self.log_performance {
+            vec![0; 4]
+        } else {
+            Vec::new()
+        };
         if self.log_performance {
             times[0] = start.elapsed().as_micros();
         }

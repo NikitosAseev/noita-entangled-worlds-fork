@@ -107,6 +107,8 @@ function net.new_rpc_namespace_with_id(id)
     return ret
 end
 
+local peer_id_cache = {}
+
 local function handle_message(msg)
     local msg_decoded
     if string.byte(msg, 1, 1) == 2 then
@@ -119,10 +121,16 @@ local function handle_message(msg)
             value2 = res[3],
         }
     elseif string.byte(msg, 1, 1) == 1 then
-        local peer_id_b = { string.byte(msg, 2, 2 + 8 - 1) }
-        local peer_id = ""
-        for _, b in ipairs(peer_id_b) do
-            peer_id = hex_table[b + 1] .. peer_id
+        -- Every mod message carries the sender's 8 raw id bytes; turning them into
+        -- the hex string only needs doing once per peer.
+        local raw_id = string.sub(msg, 2, 2 + 8 - 1)
+        local peer_id = peer_id_cache[raw_id]
+        if peer_id == nil then
+            peer_id = ""
+            for _, b in ipairs({ string.byte(raw_id, 1, -1) }) do
+                peer_id = hex_table[b + 1] .. peer_id
+            end
+            peer_id_cache[raw_id] = peer_id
         end
 
         local msg_l = string.sub(msg, 2 + 8)
@@ -163,13 +171,26 @@ local function handle_message(msg)
     end
 end
 
+-- Upper bound on the time spent handling incoming messages in one frame (seconds).
+-- Whatever is left stays queued in the socket for the next frame. World chunks
+-- can arrive in bursts, and decoding them all synchronously used to be able to
+-- stall a frame for as long as the burst was long. Generous on purpose: the proxy
+-- has a write timeout, so the queue must not be left to grow.
+local RECV_BUDGET = 0.008
+
 function net.update()
+    local start = GameGetRealWorldTimeSinceStarted()
+    local handled = 0
     while true do
         local msg = ewext.netmanager_recv()
         if msg == nil then
             break
         end
         handle_message(msg)
+        handled = handled + 1
+        if handled % 8 == 0 and GameGetRealWorldTimeSinceStarted() - start > RECV_BUDGET then
+            break
+        end
     end
     ewext.netmanager_flush()
 end

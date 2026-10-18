@@ -70,6 +70,34 @@ local Controls = ffi.typeof("Controls")
 local CharacterPos = ffi.typeof("CharacterPos")
 local FireWand = ffi.typeof("FireWand")
 
+-- The "cursor" / "notcursor" children of a peer's player entity. Looked up on
+-- every received input message, which used to walk all of the entity's children
+-- (and ask each one for its name twice). Cached per player entity, and looked up
+-- again when the entity changes or a cached child is gone.
+local function get_cursor_children(player_data)
+    local cache = player_data.cursor_cache
+    if
+        cache == nil
+        or cache.entity ~= player_data.entity
+        or cache.notcursor == nil
+        or cache.cursor == nil
+        or not EntityGetIsAlive(cache.notcursor)
+        or not EntityGetIsAlive(cache.cursor)
+    then
+        cache = { entity = player_data.entity }
+        for _, child in ipairs(EntityGetAllChildren(player_data.entity) or {}) do
+            local name = EntityGetName(child)
+            if name == "notcursor" then
+                cache.notcursor = child
+            elseif name == "cursor" then
+                cache.cursor = child
+            end
+        end
+        player_data.cursor_cache = cache
+    end
+    return cache.notcursor, cache.cursor
+end
+
 local player_fns = {
     deserialize_inputs = function(message, player_data)
         if player_data ~= nil and player_data.entity ~= nil and EntityGetIsAlive(player_data.entity) then
@@ -263,14 +291,14 @@ local player_fns = {
             end
             ComponentSetValue2(controlsComp, "mMousePosition", message.mouse_x, message.mouse_y)
 
-            for _, child in ipairs(EntityGetAllChildren(player_data.entity) or {}) do
-                if EntityGetName(child) == "notcursor" then
-                    EntityApplyTransform(child, message.mouse_x, message.mouse_y)
-                elseif EntityGetName(child) == "cursor" then
-                    player_data.mouse_x = message.my_x
-                    player_data.mouse_y = message.my_y
-                    EntityApplyTransform(child, message.my_x, message.my_y)
-                end
+            local notcursor, cursor = get_cursor_children(player_data)
+            if notcursor ~= nil then
+                EntityApplyTransform(notcursor, message.mouse_x, message.mouse_y)
+            end
+            if cursor ~= nil then
+                player_data.mouse_x = message.my_x
+                player_data.mouse_y = message.my_y
+                EntityApplyTransform(cursor, message.my_x, message.my_y)
             end
             if message.host_frame_num ~= nil then
                 ctx.host_frame_num = message.host_frame_num
@@ -447,9 +475,14 @@ end
 function player_fns.serialize_position(player_data)
     local entity = player_data.entity
     if not EntityGetIsAlive(entity) then
-        print("notalive")
+        -- This runs every frame; one line per death is enough.
+        if not player_data.notalive_logged then
+            player_data.notalive_logged = true
+            print("notalive")
+        end
         return
     end
+    player_data.notalive_logged = nil
     local x, y = EntityGetTransform(entity)
     local character_data = EntityGetFirstComponentIncludingDisabled(entity, "CharacterDataComponent")
     local character_platforming_comp = EntityGetFirstComponentIncludingDisabled(entity, "CharacterPlatformingComponent")
@@ -457,11 +490,6 @@ function player_fns.serialize_position(player_data)
         return
     end
     local vel_x, vel_y = ComponentGetValue2(character_data, "mVelocity")
-
-    if not util.is_safe_game_position(x, y) or not util.is_safe_velocity(vel_x, vel_y) then
-        print("EW: skipped unsafe local player physics state")
-        return
-    end
 
     player_data.pos_x = x
     player_data.pos_y = y
@@ -479,17 +507,15 @@ function player_fns.serialize_position(player_data)
 end
 
 function player_fns.deserialize_position(message, phys_infos, player_data)
-    if player_data == nil or not EntityGetIsAlive(player_data.entity) then
-        return
-    end
-    if not util.is_safe_game_position(message.x, message.y)
-        or not util.is_safe_velocity(message.vel_x, message.vel_y)
-    then
-        print("EW: ignored unsafe remote player physics state")
+    if player_data == nil then
         return
     end
     player_data.pos_x = message.x
     player_data.pos_y = message.y
+
+    if not EntityGetIsAlive(player_data.entity) then
+        return
+    end
     local entity = player_data.entity
     local character_data = EntityGetFirstComponentIncludingDisabled(entity, "CharacterDataComponent")
     local velocity_comp = EntityGetFirstComponentIncludingDisabled(entity, "VelocityComponent")

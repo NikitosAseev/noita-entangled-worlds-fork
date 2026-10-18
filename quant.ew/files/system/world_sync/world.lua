@@ -204,13 +204,19 @@ function world.encode_area(start_x_ini, start_y_ini, end_x_ini, end_y_ini, encod
     encoded_area.header.width = width - 1
     encoded_area.header.height = height - 1
 
-    encoded_area.header.pixel_run_count = ewext.encode_area(
+    local run_count = ewext.encode_area(
         start_x_ini,
         start_y_ini,
         end_x_ini,
         end_y_ini,
         tonumber(ffi.cast("intptr_t", encoded_area.pixel_runs))
     )
+    -- 0 means the native side refused the arguments (or isn't initialised yet);
+    -- an area with no runs would only be rejected by the receiver.
+    if run_count == 0 then
+        return nil
+    end
+    encoded_area.header.pixel_run_count = run_count
     return encoded_area
 end
 
@@ -236,28 +242,19 @@ function world.decode(grid_world, header, pixel_runs)
     local new_material = current_run.material
     local flags = current_run.flags
     local left = current_run.length + 1
-    -- Material metadata is stable during this synchronous packet decode.
-    -- Resolve it lazily once per RLE run, including a nil result.
-    local run_material_ptr = nil
-    local run_material_resolved = false
 
     local y = top_left_y
     while y < bottom_right_y do
         local x = top_left_x
         while x < bottom_right_x do
-            -- -1 explicitly means "leave existing cells unchanged". Skip the
-            -- whole remainder of this run/row without crossing the FFI boundary.
-            -- next_pixel still consumes the final position and advances runs.
-            if new_material == -1 then
-                local skip = math.min(left, bottom_right_x - x)
-                x = x + skip - 1
-                left = left - skip + 1
-                goto next_pixel
-            end
             if world_ffi.chunk_loaded(chunk_map, x, y) then
                 local ppixel = world_ffi.get_cell(chunk_map, x, y)
 
                 local current_material = 0
+
+                if new_material == -1 then
+                    goto next_pixel
+                end
 
                 if ppixel[0] ~= nil then
                     local pixel = ppixel[0]
@@ -276,11 +273,7 @@ function world.decode(grid_world, header, pixel_runs)
                     if new_material > world.last_material_id then
                         goto next_pixel
                     end
-                    if not run_material_resolved then
-                        run_material_ptr = world_ffi.get_material_ptr(new_material)
-                        run_material_resolved = true
-                    end
-                    local mat_ptr = run_material_ptr
+                    local mat_ptr = world_ffi.get_material_ptr(new_material)
                     if mat_ptr == nil then
                         goto next_pixel
                     end
@@ -297,7 +290,7 @@ function world.decode(grid_world, header, pixel_runs)
 
                     if cell_type == C.CELL_TYPE_LIQUID then
                         local liquid_cell = ffi.cast(pliquid_cell, pixel)
-                        liquid_cell.is_static = bit.band(flags, C.LIQUID_FLAG_STATIC) ~= 0
+                        liquid_cell.is_static = bit.band(flags, C.CELL_TYPE_LIQUID) == C.LIQUID_FLAG_STATIC
                     end
 
                     ppixel[0] = pixel
@@ -320,8 +313,6 @@ function world.decode(grid_world, header, pixel_runs)
                 new_material = current_run.material
                 flags = current_run.flags
                 left = current_run.length + 1
-                run_material_ptr = nil
-                run_material_resolved = false
             end
 
             x = x + 1

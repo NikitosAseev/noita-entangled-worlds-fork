@@ -393,15 +393,16 @@ local last_count = 0
 function inventory_helper.has_inventory_changed(player_data)
     local prev_inventory = player_data.prev_inventory_hash
     local inventory_hash = 0
-    if
-        player_data.entity == nil
-        or not EntityGetIsAlive(player_data.entity)
-        or GameGetAllInventoryItems(player_data.entity) == nil
-    then
+    if player_data.entity == nil or not EntityGetIsAlive(player_data.entity) then
         return false
     end
 
-    local items = GameGetAllInventoryItems(player_data.entity) or {}
+    -- One engine call instead of two (it used to be asked once for the nil check
+    -- and once more for the list).
+    local items = GameGetAllInventoryItems(player_data.entity)
+    if items == nil then
+        return false
+    end
     for _, item in ipairs(items) do
         if last_count ~= #items then
             ensure_notify_component(item)
@@ -412,7 +413,7 @@ function inventory_helper.has_inventory_changed(player_data)
         local item_comp = EntityGetFirstComponentIncludingDisabled(item, "ItemComponent")
         if item_comp ~= nil then
             local slot_x, slot_y = ComponentGetValue2(item_comp, "inventory_slot")
-            inventory_hash = (inventory_hash * 19 + (item % 65000 + slot_x + slot_y)) % (math.pow(2, 20) - 1)
+            inventory_hash = (inventory_hash * 19 + (item % 65000 + slot_x + slot_y)) % 1048575 -- 2^20 - 1
         end
     end
     last_count = #items

@@ -222,8 +222,12 @@ fn encode_area(lua: LuaState) -> ValuesOnStack {
 
     STATE.with(|state| {
         let mut state = state.borrow_mut();
-        let pws = state.particle_world_state.as_mut().unwrap();
-        let runs = unsafe { pws.encode_area(start_x, start_y, end_x, end_y, encoded_buffer) };
+        // Not initialised yet means nothing to encode; unwrapping here would panic
+        // across the FFI boundary and take the game down with it.
+        let runs = match state.particle_world_state.as_mut() {
+            Some(pws) => unsafe { pws.encode_area(start_x, start_y, end_x, end_y, encoded_buffer) },
+            None => 0,
+        };
         unsafe { LUA.lua_pushinteger(lua, runs as isize) };
     });
     ValuesOnStack(1)

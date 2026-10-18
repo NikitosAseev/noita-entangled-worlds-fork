@@ -63,6 +63,8 @@ pub(crate) struct LocalDiffModel {
     dont_save: FxHashSet<Lid>,
     phys_later: Vec<(EntityID, Vec<Option<PhysBodyInfo>>)>,
     wait_to_transfer: u8,
+    /// Failed spawn attempts per gid in `update_pending_authority`.
+    authority_retries: FxHashMap<Gid, u8>,
     pub update_buffer: Vec<EntityUpdate>,
     pub init_buffer: Vec<EntityInit>,
 }
@@ -276,6 +278,8 @@ pub(crate) struct RemoteDiffModel {
     grab_request: Vec<Lid>,
     pending_remove: Vec<Lid>,
     pending_death_notify: Vec<(Lid, bool, Option<PeerId>)>,
+    /// Lids whose copy could not be spawned; not retried every frame.
+    failed_spawn: FxHashSet<Lid>,
     peer_id: PeerId,
 }
 
@@ -299,6 +303,7 @@ impl RemoteDiffModel {
             grab_request: Default::default(),
             pending_remove: Default::default(),
             pending_death_notify: Default::default(),
+            failed_spawn: Default::default(),
             peer_id,
         }
     }
@@ -353,6 +358,7 @@ impl Default for LocalDiffModel {
             phys_later: Default::default(),
             dont_save: Default::default(),
             wait_to_transfer: 0,
+            authority_retries: Default::default(),
             update_buffer: Vec::with_capacity(512),
             init_buffer: Vec::with_capacity(512),
         }
@@ -1180,12 +1186,32 @@ impl LocalDiffModel {
         entity_manager: &mut EntityManager,
     ) -> eyre::Result<Instant> {
         while let Some(entity_data) = self.tracker.pending_authority.pop() {
-            let mut handle = spawn_entity_by_data(
+            let mut handle = match spawn_entity_by_data(
                 &entity_data.data,
                 entity_data.pos.x as f32,
                 entity_data.pos.y as f32,
                 entity_manager,
-            )?;
+            ) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    // The data was already popped, so just returning the error lost
+                    // the entity (the proxy still thinks we own it) and aborted the
+                    // rest of the frame. Keep it for a few more frames instead.
+                    let gid = entity_data.gid;
+                    let tries = self.authority_retries.entry(gid).or_insert(0);
+                    *tries += 1;
+                    if *tries < 5 {
+                        // Front of the queue = popped last, so everything else
+                        // goes first.
+                        self.tracker.pending_authority.insert(0, entity_data);
+                    } else {
+                        self.authority_retries.remove(&gid);
+                    }
+                    print_error(err.wrap_err("Failed to spawn entity we got authority over"))?;
+                    break;
+                }
+            };
+            self.authority_retries.remove(&entity_data.gid);
             let entity = handle.entity();
             entity.set_position(entity_data.pos.x as f64, entity_data.pos.y as f64, None)?;
             if entity_data.is_charmed {
@@ -1347,9 +1373,23 @@ impl LocalDiffModel {
         let l = self.entity_entries.len();
         let mut end = 0;
         let start = if start >= l { 0 } else { start };
+        // What is left of the 3 ms frame budget when this loop starts, floored so
+        // that it always makes progress (same idea as
+        // `RemoteDiffModel::apply_entities_budget_us`). It used to be measured from
+        // frame start, so a frame whose earlier phases had spent it got one entity
+        // updated per frame.
+        let budget_us = 3000u128.saturating_sub(tmr.elapsed().as_micros()).max(1000);
+        let loop_timer = Instant::now();
         for (i, (&lid, EntityEntryPair { last, current, gid })) in
             self.entity_entries.iter_mut().skip(start).enumerate()
         {
+            // Checked before the entity rather than after it: the `continue`s below
+            // (first init, pending removal) skipped the old check at the bottom, so
+            // a burst of newly tracked entities was all handled in one frame.
+            if i > 0 && loop_timer.elapsed().as_micros() > budget_us {
+                end = (start + i) % l;
+                break;
+            }
             match self
                 .tracker
                 .update_entity(
@@ -1571,10 +1611,6 @@ impl LocalDiffModel {
                         lid,
                     );
                 }
-            }
-            if tmr.elapsed().as_micros() > 3000 {
-                end = (start + i + 1) % l;
-                break;
             }
         }
         for (lid, peer) in self.tracker.pending_localize.drain(..) {
@@ -1907,8 +1943,19 @@ impl RemoteDiffModel {
                 ent.remove_component(*limb)?
             };
         }
-        let m = *ctx.fps_by_player.get(&self.peer_id).unwrap_or(&60) as f32
-            / *ctx.fps_by_player.get(&my_peer_id()).unwrap_or(&60) as f32;
+        // A peer's fps can be 0 for the first few frames (the Lua side measures
+        // frames-since-launch over seconds-since-launch), which used to turn this
+        // into inf/NaN and write that into velocities and physics transforms.
+        // Mirrors `util.fps_ratio` on the Lua side.
+        let m = {
+            let from = *ctx.fps_by_player.get(&self.peer_id).unwrap_or(&60);
+            let to = *ctx.fps_by_player.get(&my_peer_id()).unwrap_or(&60);
+            if from > 0 && to > 0 {
+                from as f32 / to as f32
+            } else {
+                1.0
+            }
+        };
         let (vx, vy) = (entity_info.vx * m, entity_info.vy * m);
         if entity_info.phys.is_empty()
             || (entity_info.is_enabled
@@ -2302,20 +2349,36 @@ impl RemoteDiffModel {
                             {
                                 continue;
                             }
-                            let entity = spawn_entity_by_data(
+                            // A copy that failed to spawn once (e.g. a file the other
+                            // peer's mods have and ours don't) is skipped from then on.
+                            // Propagating the error used to stop this peer's whole
+                            // round robin - and every peer after it - on that entity
+                            // every single frame.
+                            if self.failed_spawn.contains(lid) {
+                                continue;
+                            }
+                            let entity = match spawn_entity_by_data(
                                 &entity_info.spawn_info,
                                 entity_info.x,
                                 entity_info.y,
                                 entity_manager,
-                            )?
-                            .entity();
-                            init_remote_entity(
+                            ) {
+                                Ok(handle) => handle.entity(),
+                                Err(err) => {
+                                    self.failed_spawn.insert(*lid);
+                                    print_error(err.wrap_err("Failed to spawn remote entity"))?;
+                                    continue;
+                                }
+                            };
+                            if let Err(err) = init_remote_entity(
                                 entity,
                                 Some(*lid),
                                 self.lid_to_gid.get(lid).copied(),
                                 entity_info.drops_gold,
                                 entity_manager,
-                            )?;
+                            ) {
+                                print_error(err.wrap_err("Failed to init remote entity"))?;
+                            }
                             self.tracked.insert(*lid, entity);
                         }
                     }

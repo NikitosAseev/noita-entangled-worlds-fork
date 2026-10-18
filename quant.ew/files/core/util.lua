@@ -58,12 +58,16 @@ function util.do_i_own(ent)
     return gid == nil or ComponentGetValue2(gid, "value_bool")
 end
 
-function util.tpcall(fn, ...)
-    local res = { xpcall(fn, debug.traceback, ...) }
-    if not res[1] then
-        util.print_error(res[2])
+-- Runs once per network message, so it avoids building a table for the results.
+local function tpcall_finish(ok, ...)
+    if not ok then
+        util.print_error((...))
     end
-    return unpack(res)
+    return ok, ...
+end
+
+function util.tpcall(fn, ...)
+    return tpcall_finish(xpcall(fn, debug.traceback, ...))
 end
 
 function util.print_traceback()
@@ -390,32 +394,6 @@ end)
 
 local FULL_TURN = math.pi * 2
 
--- Physics state comes from another peer and eventually reaches the native
--- Box2D bridge.  A non-finite value or a wildly out-of-range transform makes
--- the broad phase enumerate an enormous area (and can permanently poison a
--- running world).  These limits are deliberately far beyond normal Noita and
--- parallel-world coordinates; they only reject corrupt network state.
-local MAX_SAFE_GAME_COORD = 1048576
-local MAX_SAFE_PHYSICS_VELOCITY = 65536
-
-local function is_finite(value)
-    return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
-end
-
-function util.is_safe_game_position(x, y)
-    return is_finite(x)
-        and is_finite(y)
-        and math.abs(x) <= MAX_SAFE_GAME_COORD
-        and math.abs(y) <= MAX_SAFE_GAME_COORD
-end
-
-function util.is_safe_velocity(x, y)
-    return is_finite(x)
-        and is_finite(y)
-        and math.abs(x) <= MAX_SAFE_PHYSICS_VELOCITY
-        and math.abs(y) <= MAX_SAFE_PHYSICS_VELOCITY
-end
-
 local PhysData = util.make_type({
     f32 = { "x", "y", "vx", "vy", "vr" },
     -- We should be able to cram rotation into 1 byte.
@@ -429,29 +407,9 @@ local PhysDataNoMotion = util.make_type({
     u8 = { "r" },
 })
 
-local function is_safe_phys_info(phys_info)
-    if phys_info == nil or not util.is_safe_game_position(phys_info.x, phys_info.y) or not is_finite(phys_info.r) then
-        return false
-    end
-    if ffi.typeof(phys_info) == PhysDataNoMotion then
-        return true
-    end
-    return util.is_safe_velocity(phys_info.vx, phys_info.vy)
-        and is_finite(phys_info.vr)
-        and math.abs(phys_info.vr) <= MAX_SAFE_PHYSICS_VELOCITY
-end
-
 local function serialize_phys_component(phys_component)
     local px, py, pr, pvx, pvy, pvr = np.PhysBodyGetTransform(phys_component)
     px, py = PhysicsPosToGamePos(px, py)
-    if not util.is_safe_game_position(px, py)
-        or not is_finite(pr)
-        or not util.is_safe_velocity(pvx, pvy)
-        or not is_finite(pvr)
-        or math.abs(pvr) > MAX_SAFE_PHYSICS_VELOCITY
-    then
-        error("refusing to serialize unsafe physics state")
-    end
     if math.abs(pvx) < 0.01 and math.abs(pvy) < 0.01 and math.abs(pvr) < 0.01 then
         return PhysDataNoMotion({
             x = px,
@@ -486,9 +444,6 @@ function util.fps_ratio(from_fps, to_fps)
 end
 
 local function deserialize_phys_component(phys_component, phys_info, fps)
-    if not is_safe_phys_info(phys_info) then
-        error("refusing to apply unsafe physics state")
-    end
     local x, y = GamePosToPhysicsPos(phys_info.x, phys_info.y)
     if ffi.typeof(phys_info) == PhysDataNoMotion then
         np.PhysBodySetTransform(phys_component, x, y, phys_info.r / 255 * FULL_TURN, 0, 0, 0)
@@ -512,10 +467,8 @@ function util.get_phys_info(entity, kill)
     for _, phys_component in ipairs(EntityGetComponent(entity, "PhysicsBodyComponent") or {}) do
         if phys_component ~= nil and phys_component ~= 0 then
             local ret, info = pcall(serialize_phys_component, phys_component)
-            if not ret then
-                if kill then
-                    EntityKill(entity)
-                end
+            if not ret and kill then
+                EntityKill(entity)
                 return { {}, {} }
             end
             table.insert(phys_info, info)
@@ -527,10 +480,8 @@ function util.get_phys_info(entity, kill)
             local initialized = ComponentGetValue2(phys_component, "mInitialized")
             if initialized then
                 local ret, info = pcall(serialize_phys_component, phys_component)
-                if not ret then
-                    if kill then
-                        EntityKill(entity)
-                    end
+                if not ret and kill then
+                    EntityKill(entity)
                     return { {}, {} }
                 end
                 table.insert(phys_info_2, info)
@@ -548,8 +499,8 @@ function util.set_phys_info(entity, data, fps)
     for i, phys_component in ipairs(EntityGetComponent(entity, "PhysicsBodyComponent") or {}) do
         local phys_info = phys_infos[i]
         if phys_component ~= nil and phys_component ~= 0 and phys_info ~= nil then
-            local ok = pcall(deserialize_phys_component, phys_component, phys_info, fps)
-            has_set = has_set or ok
+            pcall(deserialize_phys_component, phys_component, phys_info, fps)
+            has_set = true
         end
     end
     for i, phys_component in ipairs(EntityGetComponent(entity, "PhysicsBody2Component") or {}) do
@@ -561,8 +512,8 @@ function util.set_phys_info(entity, data, fps)
             -- A physics body doesn't exist otherwise, causing a crash
             and ComponentGetValue2(phys_component, "mInitialized")
         then
-            local ok = pcall(deserialize_phys_component, phys_component, phys_info, fps)
-            has_set = has_set or ok
+            pcall(deserialize_phys_component, phys_component, phys_info, fps)
+            has_set = true
         end
     end
     return has_set

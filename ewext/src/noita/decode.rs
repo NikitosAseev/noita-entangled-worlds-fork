@@ -195,6 +195,10 @@ impl ParticleWorldState {
         let mut flags = current.flags;
         let mut left = i32::from(current.length) + 1;
         let mut written = 0usize;
+        // `chunk_loaded` answers per world chunk (512x512, or at worst 128x128),
+        // and an encoded area is at most 128x128, so asking once per 128x128 block
+        // is enough instead of once per pixel (up to 16k calls into the game).
+        let mut loaded_cache: Option<((i32, i32), bool)> = None;
 
         for y in top_left_y..bottom_right_y {
             for x in top_left_x..bottom_right_x {
@@ -207,8 +211,17 @@ impl ParticleWorldState {
                     if new_material == -1 {
                         break 'pixel;
                     }
-                    // SAFETY: chunk_map is the game's ChunkMap for this world.
-                    if !unsafe { (fns.chunk_loaded)(chunk_map, x, y) } {
+                    let block = (x >> 7, y >> 7);
+                    let loaded = match loaded_cache {
+                        Some((key, loaded)) if key == block => loaded,
+                        _ => {
+                            // SAFETY: chunk_map is the game's ChunkMap for this world.
+                            let loaded = unsafe { (fns.chunk_loaded)(chunk_map, x, y) };
+                            loaded_cache = Some((block, loaded));
+                            loaded
+                        }
+                    };
+                    if !loaded {
                         break 'pixel;
                     }
                     // SAFETY: the chunk is loaded, so this slot exists.

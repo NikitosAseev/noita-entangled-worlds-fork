@@ -102,13 +102,31 @@ function rpc.player_update(input_data, pos_data, phys_info, current_slot, team)
         player_fns.deserialize_position(pos_data, phys_info, player_data)
     end
     if current_slot ~= nil then
+        -- set_current_slot walks this peer's whole inventory, and this runs for every
+        -- update of every peer. Only redo it when the slot changed, or every so often
+        -- in case the items were rebuilt underneath it.
+        local frame = GameGetFrameNum()
+        local is_wand, slot_x, slot_y = current_slot[1], current_slot[2], current_slot[3]
         if
-            not player_fns.set_current_slot(current_slot, player_data)
-            and (wait_on_requst[player_data.peer_id] == nil or wait_on_requst[player_data.peer_id] < GameGetFrameNum())
+            player_data.slot_applied_wand ~= is_wand
+            or player_data.slot_applied_x ~= slot_x
+            or player_data.slot_applied_y ~= slot_y
+            or player_data.slot_applied_frame == nil
+            or frame - player_data.slot_applied_frame >= 30
         then
-            print("slot empty, requesting items")
-            wait_on_requst[player_data.peer_id] = GameGetFrameNum() + 300
-            rpc.request_items(player_data.peer_id)
+            if player_fns.set_current_slot(current_slot, player_data) then
+                player_data.slot_applied_wand = is_wand
+                player_data.slot_applied_x = slot_x
+                player_data.slot_applied_y = slot_y
+                player_data.slot_applied_frame = frame
+            else
+                player_data.slot_applied_frame = nil
+                if wait_on_requst[player_data.peer_id] == nil or wait_on_requst[player_data.peer_id] < frame then
+                    print("slot empty, requesting items")
+                    wait_on_requst[player_data.peer_id] = frame + 300
+                    rpc.request_items(player_data.peer_id)
+                end
+            end
         end
     end
 end
