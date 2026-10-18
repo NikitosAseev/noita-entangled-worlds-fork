@@ -418,6 +418,15 @@ fn with_every_module(
         let mut errs = Vec::new();
         for module in state.modules.entity_sync.iter_mut() {
             if let Err(e) = f(&mut ctx, module as &mut dyn Module) {
+                // Components can disappear between the entity-sync snapshot and
+                // the current frame.  Noita then rejects ComponentGetValue2;
+                // treating that transient race as a Lua error spams the log and
+                // aborts the entire per-frame EW pass.  Ignore this one update:
+                // the next snapshot rebuilds the component list.
+                let text = format!("{e:?}");
+                if text.contains("ComponentGetValue2") && text.contains("couldn't find component") {
+                    continue;
+                }
                 errs.push(e);
             }
         }

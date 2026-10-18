@@ -10,6 +10,25 @@ local mats = {}
 
 local rpc = net.new_rpc_namespace()
 
+-- World cuts are received by every peer.  Never replicate malformed values
+-- into the native terrain/physics path; valid game explosions are untouched.
+local MAX_SAFE_WORLD_CUT_COORD = 1048576
+local MAX_SAFE_WORLD_CUT_RADIUS = 8192
+
+local function is_finite(value)
+    return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
+end
+
+local function is_safe_world_cut(x, y, radius)
+    return is_finite(x)
+        and is_finite(y)
+        and is_finite(radius)
+        and math.abs(x) <= MAX_SAFE_WORLD_CUT_COORD
+        and math.abs(y) <= MAX_SAFE_WORLD_CUT_COORD
+        and radius >= 0
+        and radius <= MAX_SAFE_WORLD_CUT_RADIUS
+end
+
 local function send_mats()
     local content_materials = ModTextFileGetContent("data/materials.xml")
     local xml_orig = nxml.parse(content_materials)
@@ -75,24 +94,31 @@ local function hole(item)
     local r = 0
     local x, y = EntityGetTransform(item)
     local n = ComponentGetValue2(ce, "radius")
+    if not is_safe_world_cut(x, y, n) then
+        hole_last[item] = nil
+        print("EW: skipped unsafe cell-eater world cut")
+        return
+    end
     if hole_last[item] ~= nil then
         local lx, ly = hole_last[item][1], hole_last[item][2]
         if lx ~= x or y ~= ly then
             local dx = x - lx
             local dy = y - ly
             r = math.sqrt(dx * dx + dy * dy)
-            local inp = math.floor(x)
-                .. " "
-                .. math.floor(lx)
-                .. " "
-                .. math.floor(y)
-                .. " "
-                .. math.floor(ly)
-                .. " "
-                .. n
-                .. " "
-                .. math.floor(ComponentGetValue2(ce, "eat_probability"))
-            net.proxy_send("cut_through_world_line", inp)
+            if is_safe_world_cut(lx, ly, r) then
+                local inp = math.floor(x)
+                    .. " "
+                    .. math.floor(lx)
+                    .. " "
+                    .. math.floor(y)
+                    .. " "
+                    .. math.floor(ly)
+                    .. " "
+                    .. n
+                    .. " "
+                    .. math.floor(ComponentGetValue2(ce, "eat_probability"))
+                net.proxy_send("cut_through_world_line", inp)
+            end
         end
     else
         local inp = math.floor(x)
@@ -199,36 +225,44 @@ function mod.on_world_update()
             if count1 > 0 then
                 if data.expl ~= nil then
                     count1 = count1 - data.expl[3]
-                    local inp = math.floor(data.expl[1])
-                        .. " "
-                        .. math.floor(data.expl[2])
-                        .. " "
-                        .. math.floor(data.expl[3])
-                        .. " "
-                        .. math.floor(data.expl[4])
-                        .. " "
-                        .. math.floor(data.expl[5])
-                        .. " "
-                        .. tostring(data.expl[6])
-                        .. " "
-                        .. tostring(data.expl[7])
-                        .. " "
-                        .. (mats[data.expl[8] or "air"] or 0)
-                        .. " "
-                        .. math.floor(data.expl[9])
-                    net.proxy_send("cut_through_world_explosion", inp)
-                    exists = true
+                    if is_safe_world_cut(data.expl[1], data.expl[2], data.expl[3]) then
+                        local inp = math.floor(data.expl[1])
+                            .. " "
+                            .. math.floor(data.expl[2])
+                            .. " "
+                            .. math.floor(data.expl[3])
+                            .. " "
+                            .. math.floor(data.expl[4])
+                            .. " "
+                            .. math.floor(data.expl[5])
+                            .. " "
+                            .. tostring(data.expl[6])
+                            .. " "
+                            .. tostring(data.expl[7])
+                            .. " "
+                            .. (mats[data.expl[8] or "air"] or 0)
+                            .. " "
+                            .. math.floor(data.expl[9])
+                        net.proxy_send("cut_through_world_explosion", inp)
+                        exists = true
+                    else
+                        print("EW: skipped unsafe explosion world cut")
+                    end
                 end
                 if data.del ~= nil then
                     count1 = count1 - data.del[3]
-                    local inp = math.floor(data.del[1])
-                        .. " "
-                        .. math.floor(data.del[2])
-                        .. " "
-                        .. math.floor(data.del[3])
-                        .. " "
-                        .. math.floor(data.del[4])
-                    net.proxy_send("cut_through_world_circle", inp)
+                    if is_safe_world_cut(data.del[1], data.del[2], data.del[3]) then
+                        local inp = math.floor(data.del[1])
+                            .. " "
+                            .. math.floor(data.del[2])
+                            .. " "
+                            .. math.floor(data.del[3])
+                            .. " "
+                            .. math.floor(data.del[4])
+                        net.proxy_send("cut_through_world_circle", inp)
+                    else
+                        print("EW: skipped unsafe material-conversion world cut")
+                    end
                 end
                 alive[ent] = nil
                 hole_last[ent] = nil

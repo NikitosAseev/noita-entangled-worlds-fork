@@ -458,6 +458,11 @@ function player_fns.serialize_position(player_data)
     end
     local vel_x, vel_y = ComponentGetValue2(character_data, "mVelocity")
 
+    if not util.is_safe_game_position(x, y) or not util.is_safe_velocity(vel_x, vel_y) then
+        print("EW: skipped unsafe local player physics state")
+        return
+    end
+
     player_data.pos_x = x
     player_data.pos_y = y
 
@@ -474,12 +479,17 @@ function player_fns.serialize_position(player_data)
 end
 
 function player_fns.deserialize_position(message, phys_infos, player_data)
-    player_data.pos_x = message.x
-    player_data.pos_y = message.y
-
     if player_data == nil or not EntityGetIsAlive(player_data.entity) then
         return
     end
+    if not util.is_safe_game_position(message.x, message.y)
+        or not util.is_safe_velocity(message.vel_x, message.vel_y)
+    then
+        print("EW: ignored unsafe remote player physics state")
+        return
+    end
+    player_data.pos_x = message.x
+    player_data.pos_y = message.y
     local entity = player_data.entity
     local character_data = EntityGetFirstComponentIncludingDisabled(entity, "CharacterDataComponent")
     local velocity_comp = EntityGetFirstComponentIncludingDisabled(entity, "VelocityComponent")

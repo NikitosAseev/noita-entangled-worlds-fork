@@ -202,12 +202,13 @@ impl ParticleWorldState {
                 // run bookkeeping below must run for every pixel regardless of
                 // whether the pixel itself was skipped.
                 'pixel: {
-                    // SAFETY: chunk_map is the game's ChunkMap for this world.
-                    if !unsafe { (fns.chunk_loaded)(chunk_map, x, y) } {
+                    // -1 means "sender had no data here". No world lookup is
+                    // needed; the Lua decoder also skips this run first.
+                    if new_material == -1 {
                         break 'pixel;
                     }
-                    // -1 means "sender had no data here", not a material.
-                    if new_material == -1 {
+                    // SAFETY: chunk_map is the game's ChunkMap for this world.
+                    if !unsafe { (fns.chunk_loaded)(chunk_map, x, y) } {
                         break 'pixel;
                     }
                     // SAFETY: the chunk is loaded, so this slot exists.
@@ -412,5 +413,70 @@ mod tests {
     fn rejects_zero_runs() {
         let data = blob(header(0), &[]);
         assert!(parse_encoded_area(&data).is_err());
+    }
+
+    #[cfg(target_arch = "x86")]
+    #[test]
+    fn unchanged_area_never_calls_game_world_functions() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "thiscall" fn get_cell(
+            _: *mut c_void,
+            _: i32,
+            _: i32,
+        ) -> *mut *mut ntypes::Cell {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            std::ptr::null_mut()
+        }
+        unsafe extern "thiscall" fn chunk_loaded(_: *mut c_void, _: i32, _: i32) -> bool {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        unsafe extern "thiscall" fn remove_cell(
+            _: *mut c_void,
+            _: *mut c_void,
+            _: i32,
+            _: i32,
+            _: bool,
+        ) {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe extern "thiscall" fn construct_cell(
+            _: *mut c_void,
+            _: i32,
+            _: i32,
+            _: *const ntypes::CellData,
+            _: *mut c_void,
+        ) -> *mut ntypes::Cell {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            std::ptr::null_mut()
+        }
+
+        CALLS.store(0, Ordering::Relaxed);
+        let mut state = ParticleWorldState {
+            _world_ptr: std::ptr::null_mut(),
+            chunk_map_ptr: std::ptr::null_mut(),
+            material_list_ptr: std::ptr::null(),
+            runner: super::super::pixel::PixelRunner::new(),
+        };
+        let fns = WorldFns {
+            get_cell,
+            chunk_loaded,
+            remove_cell,
+            construct_cell,
+            last_material_id: 0,
+        };
+        let data = blob(
+            header(1),
+            &[NoitaPixelRun {
+                length: 16383,
+                material: u16::MAX,
+                flags: 0,
+            }],
+        );
+        let written = unsafe { state.decode_area(&data, &fns) }.expect("unchanged area");
+        assert_eq!(written, 0);
+        assert_eq!(CALLS.load(Ordering::Relaxed), 0);
     }
 }

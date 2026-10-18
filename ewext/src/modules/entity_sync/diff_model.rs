@@ -1676,6 +1676,13 @@ fn collect_phys_info(entity: EntityID) -> eyre::Result<Vec<Option<PhysBodyInfo>>
         phys_bodies
             .into_iter()
             .map(|body| -> eyre::Result<Option<PhysBodyInfo>> {
+                // Noita uses i32::MAX as the invalid-body sentinel while an
+                // entity's PhysicsBodyComponent is being created or removed.
+                // Calling PhysicsBodyIDGetTransform for it raises a Lua error
+                // every frame and aborts the EW update for this entity.
+                if body.0 == i32::MAX {
+                    return Ok(None);
+                }
                 Ok(body.get_transform()?.and_then(|data| {
                     let PhysData {
                         x,
